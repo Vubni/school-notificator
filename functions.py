@@ -2,21 +2,19 @@ from database.database import Database
 
 last_id = -1
 
-def get_photo():
+async def get_photo():
     global last_id
     try:
-        with Database() as db:
+        async with Database() as db:
             # Сначала получаем последний ID
-            result = db.execute("SELECT id FROM images ORDER BY id DESC LIMIT 1")
-            if result and len(result) > 0:
-                current_id = result[0]["id"]
+            result = await db.execute("SELECT id FROM images ORDER BY id DESC")
+            if result["id"]:
                 
                 # Если изображение обновилось, получаем новые данные
-                if last_id != current_id:
-                    result = db.execute("SELECT image FROM images ORDER BY id DESC LIMIT 1")
-                    if result and len(result) > 0:
-                        last_id = current_id
-                        return result[0]["image"]
+                if last_id != result["id"]:
+                    last_id = result["id"]
+                    result = await db.execute("SELECT image FROM images ORDER BY id DESC")
+                    return result["image"]
             
         return None
     except Exception as e:
