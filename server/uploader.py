@@ -54,69 +54,50 @@ async def upload_image_to_db(image_path: str, additional_fields: Optional[dict] 
         return None
 
 
-async def upload_image_bytes_to_db(image_bytes: bytes, additional_fields: Optional[dict] = None) -> Optional[int]:
+async def upload_video_to_db(video_path: str, additional_fields: Optional[dict] = None) -> Optional[int]:
     """
-    Загружает изображение из байтов в базу данных.
+    Загружает видео в базу данных в таблицу videos.
     
     Args:
-        image_bytes: Байты изображения
-        additional_fields: Дополнительные поля для вставки
+        video_path: Путь к видеофайлу
+        additional_fields: Дополнительные поля для вставки (если есть в таблице)
         
     Returns:
         ID вставленной записи или None в случае ошибки
     """
+    # Проверяем существование файла
+    if not os.path.exists(video_path):
+        logger.error(f"Файл не найден: {video_path}")
+        return None
+    
     try:
+        # Читаем файл видео в бинарном режиме
+        with open(video_path, 'rb') as file:
+            video_data = file.read()
+        
         # Формируем SQL запрос и параметры
         if additional_fields:
-            fields = ['image'] + list(additional_fields.keys())
+            fields = ['video'] + list(additional_fields.keys())
             placeholders = ['$1'] + [f'${i+2}' for i in range(len(additional_fields))]
-            values = [image_bytes] + list(additional_fields.values())
+            values = [video_data] + list(additional_fields.values())
             
             sql = f"""
-                INSERT INTO images ({', '.join(fields)})
+                INSERT INTO videos ({', '.join(fields)})
                 VALUES ({', '.join(placeholders)})
                 RETURNING id
             """
         else:
-            sql = "INSERT INTO images (image) VALUES ($1) RETURNING id"
-            values = (image_bytes,)
+            sql = "INSERT INTO videos (video) VALUES ($1) RETURNING id"
+            values = (video_data,)
         
         # Выполняем запрос через класс Database
         async with Database() as db:
-            image_id = await db.fetchval(sql, values)
-            return image_id
+            video_id = await db.fetchval(sql, values)
+            return video_id
             
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке изображения в БД: {e}")
+    except FileNotFoundError:
+        logger.error(f"Файл видео не найден: {video_path}")
         return None
-
-
-async def get_image_from_db(image_id: int) -> Optional[bytes]:
-    """
-    Получает изображение из базы данных по ID.
-    
-    Args:
-        image_id: ID изображения в базе данных
-        
-    Returns:
-        Байты изображения или None в случае ошибки
-    """
-    try:
-        sql = "SELECT image FROM images WHERE id = $1"
-        
-        async with Database() as db:
-            result = await db.execute(sql, (image_id,))
-            
-            if result and 'image' in result:
-                return result['image']
-            else:
-                logger.error(f"Изображение с ID {image_id} не найдено")
-                return None
-                
     except Exception as e:
-        logger.error(f"Ошибка при получении изображения из БД: {e}")
+        logger.error(f"Ошибка при загрузке видео в БД: {e}")
         return None
-    
-
-import asyncio
-asyncio.run(upload_image_to_db("test.png"))
