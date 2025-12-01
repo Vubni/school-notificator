@@ -1,31 +1,19 @@
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
-
 import asyncio
-from PyQt6.QtCore import QTimer, Qt, QUrl
-from PyQt6.QtGui import QPixmap, QKeyEvent, QImage, QPainter
-from PyQt6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QLabel,
-    QWidget,
-    QStackedLayout,
-    QSizePolicy
-)
+from PyQt6.QtCore import Qt, QUrl, QTimer, QEventLoop
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QSizePolicy
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from qasync import QEventLoop, asyncSlot
+from qasync import QEventLoop
 from database.functions import init_db
-from functions import get_photo, get_video   # обе функции асинхронные
+from functions import get_video
 
 
-class ImageDisplayApp(QMainWindow):
+class VideoDisplayApp(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        loop = asyncio.get_event_loop()
 
         self.setWindowState(Qt.WindowState.WindowFullScreen)
         self.setWindowFlags(
@@ -34,183 +22,184 @@ class ImageDisplayApp(QMainWindow):
         )
         QApplication.setOverrideCursor(Qt.CursorShape.BlankCursor)
 
-        # ---------- видео фон ----------
+        # ---------- видео виджет ----------
         self.video_widget = QVideoWidget()
         self.video_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding
         )
 
+        # ---------- медиа плеер ----------
         self.media_player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(0.0)
+        
+        # Настройка медиаплеера
+        self.media_player.setPlaybackRate(1.0)
         self.media_player.setAudioOutput(self.audio_output)
         self.media_player.setVideoOutput(self.video_widget)
-
-        # (если нужен звук, уберите строку ниже и регулируйте громкость иначе)
-        self.audio_output.setVolume(0.0)
-
-        self.media_player.mediaStatusChanged.connect(
-            self.on_media_status_changed
-        )
-
+        
+        # Подключаем обработчики
+        self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.media_player.errorOccurred.connect(self.on_media_error)
+        self.media_player.playbackStateChanged.connect(self.on_playback_state_changed)
+        
+        # Для отслеживания позиции при перезапуске
+        self.is_restarting = False
+        self.video_duration = 0
         self.video_temp_path = None
+        
+        # Устанавливаем видео виджет как центральный
+        self.setCentralWidget(self.video_widget)
+        
+        # Таймер для обновления видео
+        self.setup_refresh_timer()
+        
+        # Запускаем загрузку видео через небольшой таймер
+        QTimer.singleShot(100, self.start_video_loading)
 
-        # ---------- фото поверх видео ----------
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
-        )
-        self.image_label.setStyleSheet("background-color: transparent;")
+    def start_video_loading(self):
+        """Запуск загрузки видео через asyncio"""
+        asyncio.create_task(self.load_and_play_video())
 
-        # ---------- стек для наложения ----------
-        container = QWidget()
-        stacked = QStackedLayout(container)
-        stacked.setStackingMode(QStackedLayout.StackingMode.StackAll)
-        stacked.addWidget(self.video_widget)
-        stacked.addWidget(self.image_label)
-        self.setCentralWidget(container)
+    def setup_refresh_timer(self):
+        """Настройка таймера для периодического обновления видео"""
+        # Проверяем каждые 30 минут, нужно ли обновить видео
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(lambda: asyncio.create_task(self.load_and_play_video()))
+        self.refresh_timer.start(30 * 60 * 1000)  # 30 минут
 
-        # загрузки при старте
-        loop.create_task(self.load_video())
-        loop.create_task(self.load_image())
-
-        # таймер проверки «каждую минуту»
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.check_time_and_update)
-        self.timer.start(60_000)
-
-        self.schedule_next_update()
-
-    # ---------- обработчики ----------
-
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key.Key_Escape:
-            QApplication.restoreOverrideCursor()
-            QApplication.quit()
-
-    def closeEvent(self, event):
-        self.media_player.stop()
-        self.media_player.setVideoOutput(None)        # отключаем видео-выход
-        self.media_player.setSource(QUrl())           # сбрасываем источник
-        self.audio_output.deleteLater()
-        self.media_player.deleteLater()
-
-        if self.video_temp_path and os.path.exists(self.video_temp_path):
-            try:
-                os.remove(self.video_temp_path)
-            except PermissionError:
-                pass                                   # крайний случай – можно перезапланировать удаление
-
-        super().closeEvent(event)
-
-    def mousePressEvent(self, event): pass
-    def mouseDoubleClickEvent(self, event): pass
-    def contextMenuEvent(self, event): pass
-
-    # ---------- работа с БД ----------
-
-    async def load_image(self):
-        try:
-            image_data = await get_photo()
-            if not image_data:
-                print("Ошибка: Не удалось получить изображение из базы данных")
-                return
-
-            image = QImage()
-            image.loadFromData(image_data)
-            pixmap = QPixmap.fromImage(image)
-
-            if pixmap.isNull():
-                print("Ошибка: Не удалось создать QPixmap из данных")
-                return
-
-            screen_size = self.screen().size()
-            scaled_pixmap = pixmap.scaled(
-                screen_size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-
-            final_pixmap = QPixmap(screen_size)
-            final_pixmap.fill(Qt.GlobalColor.transparent)
-
-            x = (screen_size.width() - scaled_pixmap.width()) // 2
-            y = (screen_size.height() - scaled_pixmap.height()) // 2
-
-            painter = QPainter(final_pixmap)
-            painter.drawPixmap(x, y, scaled_pixmap)
-            painter.end()
-
-            self.image_label.setPixmap(final_pixmap)
-            print("Изображение успешно загружено из базы данных")
-
-        except Exception as e:
-            print(f"Ошибка при загрузке изображения: {e}")
-
-    async def load_video(self):
+    async def load_and_play_video(self):
+        """Загружает и воспроизводит видео из БД"""
         try:
             video_data = await get_video()
             if not video_data:
                 print("Ошибка: Не удалось получить видео из базы данных")
+                QTimer.singleShot(5000, self.start_video_loading)
                 return
 
+            # Удаляем предыдущий временный файл, если существует
             if self.video_temp_path and os.path.exists(self.video_temp_path):
-                os.remove(self.video_temp_path)
+                try:
+                    os.remove(self.video_temp_path)
+                except (PermissionError, OSError):
+                    pass
 
-            fd, path = tempfile.mkstemp(suffix=".mp4")
-            with os.fdopen(fd, "wb") as tmp:
+            # Создаем новый временный файл
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.mp4') as tmp:
                 tmp.write(video_data)
+                self.video_temp_path = tmp.name
 
-            self.video_temp_path = path
-            self.media_player.setSource(QUrl.fromLocalFile(path))
-            self.media_player.play()
-            print("Видео успешно загружено из базы данных и запущено")
+            # Останавливаем текущее воспроизведение
+            if self.media_player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+                self.media_player.stop()
+            
+            # Загружаем новое видео
+            self.media_player.setSource(QUrl.fromLocalFile(self.video_temp_path))
+            
+            print("Видео успешно загружено")
 
         except Exception as e:
             print(f"Ошибка при загрузке видео: {e}")
-
-    # ---------- видео по кругу ----------
+            QTimer.singleShot(10000, self.start_video_loading)
 
     def on_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.media_player.setPosition(0)
+        """Обработка изменений статуса медиа"""
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            # Получаем длительность видео
+            self.video_duration = self.media_player.duration()
+            print(f"Медиа загружено, длительность: {self.video_duration} мс")
+            
+            # Сбрасываем флаг перезапуска
+            self.is_restarting = False
+            
+            # Запускаем воспроизведение
             self.media_player.play()
+            
+        elif status == QMediaPlayer.MediaStatus.BufferedMedia:
+            print("Медиа буферизировано")
+            
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            # Плавный перезапуск
+            self.restart_video_smoothly()
+            
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            print("Неверный медиафайл, попытка перезагрузки")
+            self.start_video_loading()
 
-    # ---------- обновление фото по расписанию ----------
+    def restart_video_smoothly(self):
+        """Плавный перезапуск видео без мерцания"""
+        if self.is_restarting:
+            return
+            
+        self.is_restarting = True
+        
+        # Используем паузу перед перемоткой для более плавного перехода
+        self.media_player.pause()
+        
+        # Перемещаем в начало
+        self.media_player.setPosition(0)
+        
+        # Даем небольшой паузу для стабилизации
+        QTimer.singleShot(50, self.resume_after_restart)
 
-    def schedule_next_update(self):
-        now = datetime.now()
-        if now.minute < 30:
-            next_update = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            next_update = (now + timedelta(hours=1)).replace(
-                minute=0, second=0, microsecond=0
-            )
+    def resume_after_restart(self):
+        """Возобновление воспроизведения после перезапуска"""
+        self.media_player.play()
+        self.is_restarting = False
 
-        time_diff = (next_update - datetime.now()).total_seconds()
-        print(f"Следующее обновление в: {next_update.strftime('%H:%M:%S')}")
+    def on_media_error(self, error, error_string):
+        """Обработка ошибок воспроизведения"""
+        print(f"Ошибка медиаплеера ({error}): {error_string}")
+        QTimer.singleShot(3000, self.start_video_loading)
 
-        self.update_timer = QTimer()
-        self.update_timer.setSingleShot(True)
-        self.update_timer.timeout.connect(
-            lambda: asyncio.create_task(self.update_image())
-        )
-        self.update_timer.start(int(time_diff * 1000))
+    def on_playback_state_changed(self, state):
+        """Обработка изменений состояния воспроизведения"""
+        states = {
+            QMediaPlayer.PlaybackState.StoppedState: "Остановлено",
+            QMediaPlayer.PlaybackState.PlayingState: "Воспроизводится",
+            QMediaPlayer.PlaybackState.PausedState: "На паузе"
+        }
+        print(f"Состояние воспроизведения: {states.get(state, 'Неизвестно')}")
 
-    def check_time_and_update(self):
-        now = datetime.now()
-        if now.minute in (0, 30) and now.second == 0:
-            asyncio.create_task(self.update_image())
+    def cleanup_resources(self):
+        """Очистка ресурсов при закрытии"""
+        if hasattr(self, 'refresh_timer'):
+            self.refresh_timer.stop()
+        
+        if self.media_player:
+            self.media_player.stop()
+            self.media_player.setVideoOutput(None)
+            self.media_player.setSource(QUrl())
+        
+        if self.video_temp_path and os.path.exists(self.video_temp_path):
+            try:
+                # Даем время на освобождение файла
+                QTimer.singleShot(100, lambda: self.safe_remove_file(self.video_temp_path))
+            except Exception as e:
+                print(f"Ошибка при удалении временного файла: {e}")
 
-    @asyncSlot()
-    async def update_image(self):
-        if hasattr(self, 'update_timer'):
-            self.update_timer.stop()
+    def safe_remove_file(self, filepath):
+        """Безопасное удаление файла"""
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            print(f"Не удалось удалить файл {filepath}: {e}")
 
-        print(f"Обновление изображения в: {datetime.now().strftime('%H:%M:%S')}")
-        await self.load_image()
-        self.schedule_next_update()
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.cleanup_and_exit()
+
+    def closeEvent(self, event):
+        self.cleanup_resources()
+        super().closeEvent(event)
+
+    def cleanup_and_exit(self):
+        """Очистка и выход из приложения"""
+        self.cleanup_resources()
+        QApplication.restoreOverrideCursor()
+        QApplication.quit()
 
 
 def main():
@@ -219,9 +208,10 @@ def main():
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
+    # Инициализация БД
     loop.run_until_complete(init_db())
 
-    window = ImageDisplayApp()
+    window = VideoDisplayApp()
     window.show()
 
     with loop:
