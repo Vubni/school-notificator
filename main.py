@@ -2,7 +2,7 @@ import os
 import sys
 import tempfile
 import asyncio
-from PyQt6.QtCore import Qt, QUrl, QTimer, QEventLoop
+from PyQt6.QtCore import Qt, QUrl, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QSizePolicy
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -45,9 +45,13 @@ class VideoDisplayApp(QMainWindow):
         self.media_player.playbackStateChanged.connect(self.on_playback_state_changed)
         
         # Для отслеживания позиции при перезапуске
-        self.is_restarting = False
         self.video_duration = 0
         self.video_temp_path = None
+        
+        # Таймер для отслеживания позиции видео
+        self.position_timer = QTimer()
+        self.position_timer.timeout.connect(self.check_position_and_loop)
+        self.position_timer.start(100)  # проверяем каждые 100мс
         
         # Устанавливаем видео виджет как центральный
         self.setCentralWidget(self.video_widget)
@@ -110,43 +114,23 @@ class VideoDisplayApp(QMainWindow):
             self.video_duration = self.media_player.duration()
             print(f"Медиа загружено, длительность: {self.video_duration} мс")
             
-            # Сбрасываем флаг перезапуска
-            self.is_restarting = False
-            
             # Запускаем воспроизведение
             self.media_player.play()
             
         elif status == QMediaPlayer.MediaStatus.BufferedMedia:
             print("Медиа буферизировано")
             
-        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
-            # Плавный перезапуск
-            self.restart_video_smoothly()
-            
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             print("Неверный медиафайл, попытка перезагрузки")
             self.start_video_loading()
 
-    def restart_video_smoothly(self):
-        """Плавный перезапуск видео без мерцания"""
-        if self.is_restarting:
-            return
-            
-        self.is_restarting = True
-        
-        # Используем паузу перед перемоткой для более плавного перехода
-        self.media_player.pause()
-        
-        # Перемещаем в начало
-        self.media_player.setPosition(0)
-        
-        # Даем небольшой паузу для стабилизации
-        QTimer.singleShot(50, self.resume_after_restart)
-
-    def resume_after_restart(self):
-        """Возобновление воспроизведения после перезапуска"""
-        self.media_player.play()
-        self.is_restarting = False
+    def check_position_and_loop(self):
+        """Проверяет текущую позицию и перематывает видео до конца, если нужно"""
+        if self.video_duration > 0:
+            current_pos = self.media_player.position()
+            # Если текущая позиция близка к концу (например, за 200мс до конца)
+            if current_pos >= (self.video_duration - 200):
+                self.media_player.setPosition(0)
 
     def on_media_error(self, error, error_string):
         """Обработка ошибок воспроизведения"""
@@ -166,6 +150,8 @@ class VideoDisplayApp(QMainWindow):
         """Очистка ресурсов при закрытии"""
         if hasattr(self, 'refresh_timer'):
             self.refresh_timer.stop()
+        if hasattr(self, 'position_timer'):
+            self.position_timer.stop()
         
         if self.media_player:
             self.media_player.stop()
